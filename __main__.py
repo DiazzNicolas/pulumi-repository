@@ -1,0 +1,121 @@
+import base64
+import json
+
+import pulumi
+import pulumi_aws as aws
+import pulumi_docker as docker
+
+app_name = "crud-api"
+account_id = "746960439931"   # tu cuenta AWS
+region = aws.config.region or "us-east-1"
+iam_role_arn = f"arn:aws:iam::{account_id}:role/LabRole"  # rol de ejecución ECS
+
+# ===== ECR =====
+repo = aws.ecr.Repository(
+    f"{app_name}-repo",
+    force_delete=True
+)
+
+pulumi.export("ecr_repo_url", repo.repository_url)
+
+auth = aws.ecr.get_authorization_token()
+decoded = base64.b64decode(auth.authorization_token).decode()
+username, password = decoded.split(":")
+
+image_full_name = repo.repository_url.apply(lambda url: f"{url}:latest")
+
+image = docker.Image(
+    f"{app_name}-image",
+    build=docker.DockerBuildArgs(context="./app"),
+    image_name=image_full_name,
+    registry=docker.RegistryArgs(
+        server=repo.repository_url,
+        username=username,
+        password=password,
+    ),
+)
+
+pulumi.export("image_name", image.image_name)
+
+# ===== VPC + Networking =====
+vpc = aws.ec2.Vpc(f"{app_name}-vpc", cidr_block="10.0.0.0/16", enable_dns_hostnames=True)
+
+subnet = aws.ec2.Subnet(
+    f"{app_name}-subnet",
+    vpc_id=vpc.id,
+    cidr_block="10.0.1.0/24",
+    map_public_ip_on_launch=True,
+)
+
+igw = aws.ec2.InternetGateway(f"{app_name}-igw", vpc_id=vpc.id)
+
+route_table = aws.ec2.RouteTable(
+    f"{app_name}-rt",
+    vpc_id=vpc.id,
+    routes=[{"cidr_block": "0.0.0.0/0", "gateway_id": igw.id}],
+)
+
+aws.ec2.RouteTableAssociation(
+    f"{app_name}-rta",
+    subnet_id=subnet.id,
+    route_table_id=route_table.id,
+)
+
+sg = aws.ec2.SecurityGroup(
+    f"{app_name}-sg",
+    vpc_id=vpc.id,
+    description="Allow inbound 80",
+    ingress=[{
+        "protocol": "tcp",
+        "from_port": 80,
+        "to_port": 80,
+        "cidr_blocks": ["0.0.0.0/0"],
+    }],
+    egress=[{
+        "protocol": "-1",
+        "from_port": 0,
+        "to_port": 0,
+        "cidr_blocks": ["0.0.0.0/0"],
+    }],
+)
+
+pulumi.export("security_group_id", sg.id)
+
+# ===== ECS Cluster =====
+cluster = aws.ecs.Cluster(f"{app_name}-cluster")
+
+# Container definitions
+container_definitions = image.image_name.apply(lambda img_name: json.dumps([{
+    "name": app_name,
+    "image": img_name,
+    "essential": True,
+    "portMappings": [{"containerPort": 80, "hostPort": 80, "protocol": "tcp"}],
+}]))
+
+# Task Definition
+task_def = aws.ecs.TaskDefinition(
+    f"{app_name}-task",
+    family=f"{app_name}-family",
+    cpu="256",
+    memory="512",
+    network_mode="awsvpc",
+    requires_compatibilities=["FARGATE"],
+    execution_role_arn=iam_role_arn,
+    container_definitions=container_definitions,
+)
+
+# Service
+service = aws.ecs.Service(
+    f"{app_name}-service",
+    cluster=cluster.arn,
+    task_definition=task_def.arn,
+    desired_count=1,
+    launch_type="FARGATE",
+    network_configuration=aws.ecs.ServiceNetworkConfigurationArgs(
+        assign_public_ip=True,
+        subnets=[subnet.id],
+        security_groups=[sg.id],
+    ),
+)
+
+pulumi.export("service_name", service.name)
